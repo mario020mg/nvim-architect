@@ -286,6 +286,90 @@ local function send_message()
 end
 
 ---------------------------------------------------------------------------
+-- Step 8: implement files one by one from state.file_descriptions
+---------------------------------------------------------------------------
+
+local function implement_files(file_list, index, context, on_all_done)
+  if index > #file_list then
+    on_all_done()
+    return
+  end
+
+  local filepath = file_list[index]
+  local description = (state.file_descriptions or {})[filepath] or "no description"
+  local root = vim.fn.getcwd()
+  local full_path = root .. "/" .. filepath
+
+  -- Show which file we're working on
+  buf_append(bufs.chat, {
+    "",
+    "  ── File " .. index .. " / " .. #file_list .. ": " .. filepath,
+    "  " .. description,
+    "",
+  })
+  scroll_bottom(wins.chat)
+
+  -- Create parent directories and an empty file immediately
+  local dir = full_path:match("^(.*)/[^/]*$")
+  if dir then vim.fn.mkdir(dir, "p") end
+  vim.fn.writefile({}, full_path)
+
+  local system = [[
+You are implementing a single source file. Return ONLY the raw file contents.
+No markdown fences, no explanation, no commentary before or after.
+Just the code that goes in the file.
+]] .. "\n\n--- PROJECT CONTEXT ---\n" .. context
+
+  local prompt = "Implement this file: " .. filepath .. "\nPurpose: " .. description
+
+  is_streaming = true
+  buf_append(bufs.chat, { "  AI ◆", "", "  " })
+
+  local full_response = ""
+
+  openai.chat(
+    { { role = "user", content = prompt } },
+    system,
+    function(chunk)
+      -- Stream to chat
+      stream_chunk(chunk)
+      -- Accumulate for disk write
+      full_response = full_response .. chunk
+    end,
+    function(full_text, err)
+      is_streaming = false
+
+      if err then
+        buf_append(bufs.chat, {
+          "",
+          "  ⚠ Error writing " .. filepath .. ": " .. err,
+          "  ──────────────────────────────────────────",
+          "",
+        })
+        scroll_bottom(wins.chat)
+      else
+        -- Write full response to disk
+        local content = full_text or full_response
+        vim.fn.writefile(vim.split(content, "\n"), full_path)
+
+        buf_append(bufs.chat, {
+          "",
+          "  ✓ Written: " .. filepath,
+          "  ──────────────────────────────────────────",
+          "",
+        })
+        scroll_bottom(wins.chat)
+      end
+
+      -- Next file
+      vim.schedule(function()
+        implement_files(file_list, index + 1, context, on_all_done)
+      end)
+    end
+  )
+end
+
+---------------------------------------------------------------------------
 -- Save & advance
 ---------------------------------------------------------------------------
 
@@ -312,13 +396,72 @@ local function save_and_next()
     end)
     return
   end
-  do_save(last_ai)   -- ← añade esta
-end        
+  do_save(last_ai)
+end
 
 function do_save(ai_text)
   local step = steps_def.get(state.current_step)
 
-  -- Steps 8, 9, 10: ask for filename and write AI code block to disk
+  -- Step 8: automated file-by-file implementation from state.file_descriptions
+  if step.id == 8 then
+    local file_descriptions = state.file_descriptions or {}
+    local file_list = {}
+    for path, _ in pairs(file_descriptions) do
+      table.insert(file_list, path)
+    end
+    table.sort(file_list)
+
+    if #file_list == 0 then
+      vim.notify("[architect] No files found from step 7. Complete step 7 first.", vim.log.levels.WARN)
+      return
+    end
+
+    local context = steps_def.get_context(state)
+
+    buf_append(bufs.chat, {
+      "",
+      "  ── Starting implementation: " .. #file_list .. " files ──",
+      "",
+    })
+    scroll_bottom(wins.chat)
+
+    implement_files(file_list, 1, context, function()
+      -- All files done — save summary and advance
+      local summary = "Implemented " .. #file_list .. " files from step 7 file structure."
+      pcall(step.save_action, state, summary)
+
+      if not vim.tbl_contains(state.completed_steps, state.current_step) then
+        table.insert(state.completed_steps, state.current_step)
+      end
+
+      memory.save(state)
+      memory.export_summary(state)
+
+      buf_append(bufs.chat, {
+        "",
+        "  ✓ All files implemented. Advancing to next step.",
+        "  ──────────────────────────────────────────",
+        "",
+      })
+      scroll_bottom(wins.chat)
+
+      local next_step = state.current_step + 1
+      if next_step <= #steps_def.steps then
+        state.current_step = next_step
+        memory.save(state)
+        render_sidebar()
+        render_step()
+      else
+        render_sidebar()
+      end
+
+      vim.schedule(function() focus_input() end)
+    end)
+
+    return -- early return: advancement handled inside implement_files chain
+  end
+
+  -- Steps 9, 10 (code type): manual filename prompt as before
   if step.type == "code" then
     local root = vim.fn.getcwd()
     local history = memory.get_conversation(state, state.current_step)
@@ -336,7 +479,6 @@ function do_save(ai_text)
       local dir = full:match("^(.*)/[^/]*$")
       if dir then vim.fn.mkdir(dir, "p") end
 
-      -- Extract code between first ``` block, fallback to full message
       local code = last_ai and last_ai:match("```[%w]*\n(.-)\n```") or last_ai
       if not code then code = last_ai or "" end
 
@@ -355,7 +497,6 @@ function do_save(ai_text)
     table.insert(state.completed_steps, state.current_step)
   end
 
-  -- Flush context.md before moving on
   memory.save(state)
   memory.export_summary(state)
 

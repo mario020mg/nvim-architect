@@ -151,16 +151,46 @@ When agreed:
     system_prompt = RULES .. [[
 Step 7: File structure.
 Based on the PROJECT CONTEXT, propose a folder tree for the project root.
-Include a one-line description per file.
-When agreed:
+
+CRITICAL: Every single response — including the very first one — must end with BOTH:
+1. A human-readable ASCII tree for display
+2. The [READY_TO_SAVE] block with the JSON immediately after
+
+Do NOT wait for the user to agree before outputting [READY_TO_SAVE]. Output it every time.
+Do NOT put the tree inside the JSON. The tree is for display only.
+
+Format your response exactly like this:
+<ASCII tree here>
+
 [READY_TO_SAVE]
-{"tree":"<folder tree as string>","descriptions":{"path/file":"what it does"}}]],
+{"tree":"<same folder tree as a single string with \n for newlines>","descriptions":{"relative/path/to/file.js":"one line description"}}
+
+The "descriptions" object must use relative paths (no leading slash, no absolute paths).
+Every file in the tree must have an entry in "descriptions".
+]],
     save_action = function(state, content)
       local ok, parsed = pcall(vim.json.decode, content)
-      if ok and parsed then
+      if ok and parsed and type(parsed) == "table" then
         state.file_structure    = parsed.tree or ""
         state.file_descriptions = parsed.descriptions or {}
+        return
       end
+
+      -- Fallback: JSON failed, try to extract file paths from the raw tree text
+      -- Matches lines ending in .ext optionally followed by // comment
+      local descriptions = {}
+      for line in content:gmatch("[^\n]+") do
+        -- Extract relative paths like src/models/User.js
+        local filepath = line:match("([%w_%-]+/[%w_%.%-/]+%.[%w]+)")
+        if filepath then
+          -- Grab inline comment if present
+          local desc = line:match("//%s*(.+)$") or "no description"
+          descriptions[filepath] = desc:match("^%s*(.-)%s*$")
+        end
+      end
+
+      state.file_structure    = content
+      state.file_descriptions = descriptions
     end,
   },
   {
